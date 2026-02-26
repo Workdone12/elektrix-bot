@@ -1,20 +1,25 @@
 // api/chat.js — ElektrixStore Bot Proxy
-// Déployé sur Vercel — NE PAS exposer ce fichier côté client
+// Chat + Transcription Whisper pour Safari/tous navigateurs
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const WC_CONSUMER_KEY = process.env.WC_CONSUMER_KEY;
 const WC_CONSUMER_SECRET = process.env.WC_CONSUMER_SECRET;
 const WC_STORE_URL = process.env.WC_STORE_URL;
 
+// ─── CORS helper ─────────────────────────────────────────────────────────────
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "https://elektrixstore.com");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
 // ─── Récupère les produits WooCommerce ───────────────────────────────────────
 async function fetchProducts(query) {
   try {
     const auth = Buffer.from(`${WC_CONSUMER_KEY}:${WC_CONSUMER_SECRET}`).toString("base64");
-    
-    // Recherche par mot-clé si fourni, sinon les 50 premiers produits
     const searchParam = query ? `&search=${encodeURIComponent(query)}` : "";
     const url = `${WC_STORE_URL}/wp-json/wc/v3/products?per_page=20&status=publish${searchParam}`;
-    
+
     const res = await fetch(url, {
       headers: { Authorization: `Basic ${auth}` },
     });
@@ -42,13 +47,17 @@ async function fetchProducts(query) {
   }
 }
 
-// ─── Système prompt avec infos boutique ──────────────────────────────────────
+// ─── Système prompt ───────────────────────────────────────────────────────────
 function buildSystemPrompt(products, lang) {
-  const productList = products.length > 0
-    ? products.map((p) =>
-        `- ${p.name} | ${p.price}${p.sale_price ? ` (nuolaida: ${p.sale_price})` : ""} | ${p.stock}${p.stock_quantity ? ` (${p.stock_quantity} vnt.)` : ""} | ${p.category} | ${p.url}`
-      ).join("\n")
-    : "Produktų sąrašas šiuo metu nepasiekiamas.";
+  const productList =
+    products.length > 0
+      ? products
+          .map(
+            (p) =>
+              `- ${p.name} | ${p.price}${p.sale_price ? ` (nuolaida: ${p.sale_price})` : ""} | ${p.stock}${p.stock_quantity ? ` (${p.stock_quantity} vnt.)` : ""} | ${p.category} | ${p.url}`
+          )
+          .join("\n")
+      : "Produktų sąrašas šiuo metu nepasiekiamas.";
 
   const isLT = lang === "lt";
 
@@ -69,10 +78,10 @@ PRISTATYMAS IR GRĄŽINIMAS:
 
 GARANTIJA IR MOKĖJIMAS:
 - 24 mėnesių nemokama garantija
-- Mokėjimas: banko pavedimas,  Visa, Mastercard, Google Pay, Apple Pay
+- Mokėjimas: Visa, Mastercard, Google Pay, Apple Pay, banko pavedimas
 - 100% saugūs mokėjimai (PCI-DSS, SSL/TLS 256 bitų)
 
-PRODUKTAI (atnaujinta realiuoju laiku iš WooCommerce):
+PRODUKTAI (atnaujinta realiuoju laiku):
 ${productList}
 
 TAISYKLĖS:
@@ -112,16 +121,95 @@ RULES:
 - Introduce yourself as "ElektrixStore assistant"`;
 }
 
-// ─── Handler principal ────────────────────────────────────────────────────────
+// ─── HANDLER PRINCIPAL ────────────────────────────────────────────────────────
 export default async function handler(req, res) {
-  // CORS — autorise votre site Hostinger
-  res.setHeader("Access-Control-Allow-Origin", "https://elektrixstore.com");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
+  setCors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
+  // ── ROUTE : Transcription Whisper ──────────────────────────────────────────
+  // On détecte si c'est une requête de transcription audio
+  const contentType = req.headers["content-type"] || "";
+
+  if (contentType.includes("multipart/form-data")) {
+    try {
+      // Récupère le body brut
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const buffer = Buffer.concat(chunks);
+
+      // Recrée un FormData pour Groq Whisper
+      const boundary = contentType.split("boundary=")[1];
+      const formData = new FormData();
+
+      // Extrait le fichier audio du buffer multipart
+      const boundaryBuffer = Buffer.from(`--${boundary}`);
+      const parts = [];
+      let start = 0;
+
+      for (let i = 0; i < buffer.length; i++) {
+        if (buffer.slice(i, i + boundaryBuffer.length).equals(boundaryBuffer)) {
+          if (start > 0) parts.push(buffer.slice(start, i - 2));
+          start = i + boundaryBuffer.length + 2;
+        }
+      }
+
+      // Trouve la partie audio
+      let audioBuffer = null;
+      let audioType = "audio/webm";
+
+      for (const part of parts) {
+        const headerEnd = part.indexOf("\r\n\r\n");
+        if (headerEnd === -1) continue;
+        const headers = part.slice(0, headerEnd).toString();
+        const body = part.slice(headerEnd + 4);
+
+        if (headers.includes('name="audio"')) {
+          audioBuffer = body;
+          if (headers.includes("audio/mp4")) audioType = "audio/mp4";
+          else if (headers.includes("audio/ogg")) audioType = "audio/ogg";
+          else if (headers.includes("audio/wav")) audioType = "audio/wav";
+          break;
+        }
+      }
+
+      if (!audioBuffer) {
+        return res.status(400).json({ error: "No audio found" });
+      }
+
+      // Envoie à Groq Whisper
+      const whisperForm = new FormData();
+      const blob = new Blob([audioBuffer], { type: audioType });
+      whisperForm.append("file", blob, `audio.${audioType.split("/")[1]}`);
+      whisperForm.append("model", "whisper-large-v3");
+      whisperForm.append("language", req.headers["x-lang"] === "en" ? "en" : "lt");
+      whisperForm.append("response_format", "text");
+
+      const whisperRes = await fetch(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+          body: whisperForm,
+        }
+      );
+
+      if (!whisperRes.ok) {
+        const err = await whisperRes.text();
+        console.error("Whisper error:", err);
+        return res.status(500).json({ error: "Whisper error" });
+      }
+
+      const transcript = await whisperRes.text();
+      return res.status(200).json({ transcript: transcript.trim() });
+
+    } catch (e) {
+      console.error("Transcription error:", e);
+      return res.status(500).json({ error: "Transcription failed" });
+    }
+  }
+
+  // ── ROUTE : Chat classique ─────────────────────────────────────────────────
   try {
     const { messages, lang = "lt" } = req.body;
 
@@ -129,17 +217,12 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Invalid messages format" });
     }
 
-    // Extrait le dernier message utilisateur pour la recherche produits
     const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
     const userQuery = lastUserMessage?.content || "";
 
-    // Récupère les produits WooCommerce en temps réel
     const products = await fetchProducts(userQuery);
-
-    // Construit le système prompt avec les données fraîches
     const systemPrompt = buildSystemPrompt(products, lang);
 
-    // Appelle Groq
     const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -150,7 +233,7 @@ export default async function handler(req, res) {
         model: "llama-3.3-70b-versatile",
         messages: [
           { role: "system", content: systemPrompt },
-          ...messages.slice(-10), // garde les 10 derniers messages pour le contexte
+          ...messages.slice(-10),
         ],
         max_tokens: 500,
         temperature: 0.7,
